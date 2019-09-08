@@ -21,7 +21,8 @@ import Firebase
 
 @objc(CameraViewController)
 class CameraViewController: UIViewController {
-  private let detectors: [Detector] = [.onDeviceAutoMLImageLabeler,
+  private let detectors: [Detector] = [.onDeviceImageLabeler,
+                                       .onDeviceAutoMLImageLabeler,
                                        .onDeviceFace,
                                        .onDeviceText,
                                        .onDeviceObjectProminentNoClassifier,
@@ -38,6 +39,8 @@ class CameraViewController: UIViewController {
   private var areAutoMLModelsRegistered = false
   private lazy var modelManager = ModelManager.modelManager()
   @IBOutlet var downloadProgressView: UIProgressView!
+  
+  private var shouldStopCapture = false
 
   private lazy var previewOverlayView: UIImageView = {
 
@@ -99,6 +102,95 @@ class CameraViewController: UIViewController {
     isUsingFrontCamera = !isUsingFrontCamera
     removeDetectionAnnotations()
     setUpCaptureSessionInput()
+  }
+    
+  // MARK: - On-Device Normal Detections
+  
+  private func detectImageLabelOndevice(
+    in visionImage: VisionImage,
+    width: CGFloat,
+    height: CGFloat) {
+    
+    // [START config_label]
+    let options = VisionOnDeviceImageLabelerOptions()
+    options.confidenceThreshold = Constant.labelConfidenceThreshold
+    // [END config_label]
+    
+    // [START init_label]
+    let onDeviceLabeler = vision.onDeviceImageLabeler(options: options)
+    // [END init_label]
+    
+    print("labeler: \(onDeviceLabeler)\n")
+    
+    let group = DispatchGroup()
+    group.enter()
+    
+    onDeviceLabeler.process(visionImage) { detectedLabels, error in
+      defer { group.leave() }
+      
+      self.updatePreviewOverlayView()
+      self.removeDetectionAnnotations()
+      
+      if let error = error {
+        print("Failed to detect labels with error: \(error.localizedDescription).")
+        return
+      }
+      
+      guard let labels = detectedLabels, !labels.isEmpty else {
+        return
+      }
+      
+      let annotationFrame = self.annotationOverlayView.frame
+      let resultsRect = CGRect(
+        x: annotationFrame.origin.x + Constant.padding,
+        y: annotationFrame.size.height - Constant.padding - Constant.resultsLabelHeight,
+        width: annotationFrame.width - 2 * Constant.padding,
+        height: Constant.resultsLabelHeight
+      )
+      let resultsLabel = UILabel(frame: resultsRect)
+      resultsLabel.textColor = .yellow
+      resultsLabel.text = labels.map { label -> String in
+        return "Label: \(label.text), Confidence: \(label.confidence ?? 0)"
+        }.joined(separator: "\n")
+      resultsLabel.adjustsFontSizeToFitWidth = true
+      resultsLabel.numberOfLines = Constant.resultsLabelLines
+      self.annotationOverlayView.addSubview(resultsLabel)
+      
+      let birdLabels = labels.filter { $0.text.lowercased()  == "bird" }
+      if let birdLabel = birdLabels.first {
+        let conf = (birdLabel.confidence ?? 0) as Double
+        if conf > 0.8 {
+          self.makeCrowRepellingSound()
+        }
+      }
+    }
+    
+    group.wait()
+  }
+  
+  private func makeCrowRepellingSound() {
+    self.shouldStopCapture = true
+    print("BIRD DETECTED!!!")
+    
+    self.stopSession()
+    guard let url = Bundle.main.url(forResource: "crow_repelling_sound", withExtension: "mp3") else { return }
+    
+    do {
+      try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+      try AVAudioSession.sharedInstance().setActive(true)
+      
+      /* The following line is required for the player to work on iOS 11. Change the file type accordingly*/
+      let player = try AVAudioPlayer(contentsOf: url, fileTypeHint: AVFileType.mp3.rawValue)
+      player.play()
+      print("Start making sound")
+      sleep(5)
+    } catch let error {
+      print(error.localizedDescription)
+    }
+    
+    print("Stop making sound")
+    self.startSession()
+    self.shouldStopCapture = false
   }
 
   // MARK: - On-Device AutoML Detections
@@ -736,6 +828,11 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
     didOutput sampleBuffer: CMSampleBuffer,
     from connection: AVCaptureConnection
     ) {
+    if shouldStopCapture {
+      stopSession()
+      return
+    }
+    
     guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
       print("Failed to get image buffer from sample buffer.")
       return
@@ -768,6 +865,8 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 
     switch currentDetector {
+    case .onDeviceImageLabeler:
+      detectImageLabelOndevice(in: visionImage, width: imageWidth, height: imageHeight)
     case .onDeviceAutoMLImageLabeler:
       detectImageLabelsAutoMLOndevice(in: visionImage, width: imageWidth, height: imageHeight)
     case .onDeviceFace:
@@ -791,6 +890,7 @@ extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
 // MARK: - Constants
 
 public enum Detector: String {
+  case onDeviceImageLabeler = "On-Device Normal Image Labeler"
   case onDeviceAutoMLImageLabeler = "On-Device AutoML Image Labeler"
   case onDeviceFace = "On-Device Face Detection"
   case onDeviceText = "On-Device Text Recognition"
